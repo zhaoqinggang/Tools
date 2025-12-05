@@ -21,3 +21,5 @@ pip install transformers>=4.56.1
 pip install peft
 pip install bitsandbytes
 ```
+
+python -c "import trl; print(f'TRL 版本: {trl.__version__}')"
