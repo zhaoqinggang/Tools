@@ -1,0 +1,23 @@
+### 3. 安装 PyTorch
+
+**CUDA 11.8:**
+```bash
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+```
+
+**CUDA 12.1:**
+```bash
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+```
+
+### 4. 安装依赖
+
+```bash
+cd /path/to/trl
+pip install -e .
+pip install accelerate>=1.4.0
+pip install datasets>=3.0.0
+pip install transformers>=4.56.1
+pip install peft
+pip install bitsandbytes
+```
