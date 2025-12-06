@@ -176,6 +176,12 @@ VERL 提供了自动化安装脚本，会安装所有必要的依赖：
 cd /root/code/zqg/verl
 bash scripts/install_vllm_sglang_mcore.sh
 ```
+export PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+export PIP_TRUSTED_HOST=pypi.tuna.tsinghua.edu.cn
+bash scripts/install_vllm_sglang_mcore.sh
+
+
+
 
 **使用 FSDP（更节省显存，适合中小规模模型）：**
 ```bash
