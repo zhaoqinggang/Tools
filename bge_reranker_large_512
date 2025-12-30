@@ -1,0 +1,40 @@
+import os
+
+import torch
+from transformers import AutoModelForSequenceClassification, AutoTokenizer
+
+
+device="cuda"
+## BGE Ranker model
+
+bge_model_path = os.path.abspath(os.path.dirname(__file__)) + "/models/"
+print(bge_model_path)
+bge_tokenizer = AutoTokenizer.from_pretrained(bge_model_path)
+bge_model = AutoModelForSequenceClassification.from_pretrained(bge_model_path)
+bge_model.to(device)
+bge_model.eval()
+
+
+class BGEReranker:
+
+    def predict(self, params):
+
+        pairs = params.get("pairs", [])
+        if not pairs: return {"scores": []} 
+        with torch.no_grad():
+            inputs = bge_tokenizer(pairs, padding=True, truncation=True, return_tensors='pt', max_length=512)
+            for k, v in inputs.items(): inputs[k] = v.to(device)
+            scores = bge_model(**inputs, return_dict=True).logits.view(-1, ).float().tolist()
+        return {"scores": scores} 
+
+def init(params):
+    reranker = BGEReranker()
+    return reranker
+
+
+if __name__ == '__main__':
+    reranker = BGEReranker()
+
+    params = {"pairs": [("你好", "你好")]}
+    scores = reranker.predict(params)
+    print(scores)
