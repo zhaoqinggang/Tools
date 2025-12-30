@@ -1,0 +1,423 @@
+# 助力车 8B：SFT & GRPO 极简脚本包（仅 .sh/.yaml）
+
+生成时间：2025-12-30T07:17:00+00:00
+
+## 收录文件（每类流程 1 个代表）
+- /root/code/zqg/trl/commands/run_sft.sh
+- /root/code/zqg/train_model/sft_zhuliche.sh
+- /root/code/zqg/train_model/zhuliche_sft_config.yaml
+- /root/code/zqg/train_model/grpo_8b_zhuliche.sh
+- /root/code/zqg/train_model/zhuliche_grpo_8b_config.yaml
+- /root/code/zqg/train_model/merge_lora.sh
+- /root/code/nxw/verl/merge_zhuliche_step48.sh
+- /root/code/nxw/verl/run_grpo_zhuliche.sh
+
+---
+
+## /root/code/zqg/trl/commands/run_sft.sh
+
+```bash
+#!/bin/bash
+# This script runs an SFT example end-to-end on a tiny model using different possible configurations
+# but defaults to QLoRA + PEFT
+OUTPUT_DIR="test_sft/"
+MODEL_NAME="trl-internal-testing/tiny-Qwen2ForCausalLM-2.5"
+DATASET_NAME="stanfordnlp/imdb"
+MAX_STEPS=5
+BATCH_SIZE=2
+SEQ_LEN=128
+
+
+# Handle extra arguments in case one passes accelerate configs.
+EXTRA_ACCELERATE_ARGS=""
+EXTRA_TRAINING_ARGS="""--use_peft \
+    --load_in_4bit
+"""
+
+# Set your number of GPUs here
+NUM_GPUS=2
+
+if [[ "${TRL_ACCELERATE_CONFIG}" == "" ]]; then
+  EXTRA_ACCELERATE_ARGS=""
+else
+  EXTRA_ACCELERATE_ARGS="--config_file $TRL_ACCELERATE_CONFIG"
+  # For DeepSpeed configs we need to set the `--fp16` flag to comply with our configs exposed
+  # on `examples/accelerate_configs` and our runners do not support bf16 mixed precision training.
+  if [[ $TRL_ACCELERATE_CONFIG == *"deepspeed"* ]]; then
+    EXTRA_TRAINING_ARGS="--fp16"
+  else
+    echo "Keeping QLoRA + PEFT"
+  fi
+fi
+
+
+CMD="""
+accelerate launch $EXTRA_ACCELERATE_ARGS \
+    --num_processes $NUM_GPUS \
+    --mixed_precision 'fp16' \
+    `pwd`/trl/scripts/sft.py \
+    --model_name $MODEL_NAME \
+    --dataset_name $DATASET_NAME \
+    --output_dir $OUTPUT_DIR \
+    --max_steps $MAX_STEPS \
+    --per_device_train_batch_size $BATCH_SIZE \
+    --max_length $SEQ_LEN \
+    $EXTRA_TRAINING_ARGS
+"""
+
+echo "Starting program..."
+
+{ # try
+    echo $CMD
+    eval "$CMD"
+} || { # catch
+    # save log for exception 
+    echo "Operation Failed!"
+    exit 1
+}
+exit 0
+```
+
+---
+
+## /root/code/zqg/train_model/sft_zhuliche.sh
+
+```bash
+#!/bin/bash
+# 多卡 SFT 训练脚本
+
+export TORCH_DISTRIBUTED_DEBUG=INFO
+export NCCL_DEBUG=INFO
+export NCCL_P2P_DISABLE=0
+export NCCL_P2P_LEVEL=NVL
+
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+# 离线模式，避免连接 Hugging Face Hub
+export TRANSFORMERS_OFFLINE=1
+export HF_DATASETS_OFFLINE=1
+
+# 设置使用的 GPU 数量（单卡训练）
+NUM_GPUS=1
+
+# ============================================
+# 单卡训练（不使用分布式）
+# ============================================
+CUDA_VISIBLE_DEVICES=6 accelerate launch \
+    --num_processes $NUM_GPUS \
+    /root/code/zqg/trl/trl/scripts/sft.py \
+    --config /root/code/zqg/train_model/zhuliche_sft_config.yaml
+
+# ============================================
+# 方案2：使用 ZeRO-3（如果方案1遇到OOM）
+# 取消下面的注释，并注释掉上面的方案1
+# ============================================
+# CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 accelerate launch \
+#     --num_processes $NUM_GPUS \
+#     --config_file /root/code/zqg/trl/examples/accelerate_configs/deepspeed_zero3.yaml \
+#     /root/code/zqg/trl/trl/scripts/sft.py \
+#     --config /root/code/zqg/train_model/zhuliche_sft_config.yaml```
+
+---
+
+## /root/code/zqg/train_model/zhuliche_sft_config.yaml
+
+```yaml
+model_name_or_path: /root/code/zqg/downloaded_models/Qwen3-8b/Qwen/Qwen3-8B
+trust_remote_code: true
+dtype: bfloat16
+# 使用 Flash Attention 2 以支持 packing（无填充训练）
+attn_implementation: flash_attention_2
+# 训练集和验证集
+datasets:
+  - path: json
+    data_files: /root/code/zqg/trl/train_data/12/sft_training_data_with_think_train.jsonl
+    split: train
+  - path: json
+    data_files: /root/code/zqg/trl/train_data/12/sft_training_data_with_think_val.jsonl
+    split: train
+dataset_train_split: train
+dataset_test_split: null  # 验证集已单独加载
+learning_rate: 2.0e-4
+num_train_epochs: 4  # 从2增加到4，继续训练更多轮次
+packing: true
+# 设置最大序列长度，避免数据被截断（数据集中最大约6929 tokens）
+max_length: 8192
+# 减小 batch size 以减少显存占用
+per_device_train_batch_size: 2
+per_device_eval_batch_size: 2
+# 增加 gradient accumulation 以保持有效 batch size (2 * 16 = 32, 接近原来的 4 * 8 = 32)
+gradient_accumulation_steps: 8
+gradient_checkpointing: true
+# 设置 use_reentrant=False 以解决 DDP + LoRA + gradient checkpointing 的兼容性问题
+gradient_checkpointing_kwargs:
+  use_reentrant: false
+eos_token: '<|im_end|>'
+# 评估策略：每次保存时都进行评估
+eval_strategy: steps
+eval_steps: 50  # 每50步评估一次，获得更多评估点
+save_strategy: steps
+save_steps: 50  # 与eval_steps对齐，确保每次评估后都保存，不会错过最好的模型
+save_total_limit: 3  # 最多保留3个checkpoint，避免占用过多磁盘空间
+# 在保存时进行评估，确保每次保存都有验证集准确性
+load_best_model_at_end: true
+metric_for_best_model: eval_loss
+greater_is_better: false
+use_peft: true
+# 减小 LoRA rank 以减少显存占用
+lora_r: 32
+lora_alpha: 16
+output_dir: /root/code/zqg/train_model/Qwen3-8b-lora-zhuliche
+push_to_hub: false
+# 从checkpoint-400继续训练
+resume_from_checkpoint: /root/code/zqg/train_model/Qwen3-8b-lora-zhuliche/checkpoint-400
+
+```
+
+---
+
+## /root/code/zqg/train_model/grpo_8b_zhuliche.sh
+
+```bash
+#!/bin/bash
+# 8B 模型 GRPO 训练脚本 - zhuliche（助力车）数据集
+
+export TORCH_DISTRIBUTED_DEBUG=INFO
+export NCCL_DEBUG=INFO
+export NCCL_P2P_DISABLE=0
+export NCCL_P2P_LEVEL=NVL
+
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+# 离线模式，避免连接 Hugging Face Hub
+export TRANSFORMERS_OFFLINE=1
+export HF_DATASETS_OFFLINE=1
+
+# 设置使用的 GPU 数量（单卡训练）
+NUM_GPUS=8
+
+# ============================================
+# 单卡训练（不使用分布式）
+# ============================================
+# CUDA_VISIBLE_DEVICES=0 accelerate launch \
+#     --num_processes $NUM_GPUS \
+#     /root/code/zqg/trl/trl/scripts/grpo.py \
+#     --config /root/code/zqg/train_model/zhuliche_grpo_8b_config.yaml
+
+# ============================================
+# LoRA 训练：使用标准 DDP（不需要 ZeRO）
+# LoRA 只训练少量参数，内存占用小，使用普通分布式训练即可
+# ============================================
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 accelerate launch \
+    --num_processes $NUM_GPUS \
+    --config_file /root/code/zqg/trl/examples/accelerate_configs/multi_gpu.yaml \
+    /root/code/zqg/trl/trl/scripts/grpo.py \
+    --config /root/code/zqg/train_model/zhuliche_grpo_8b_config.yaml
+
+```
+
+---
+
+## /root/code/zqg/train_model/zhuliche_grpo_8b_config.yaml
+
+```yaml
+# GRPO训练配置文件 - 8B模型 zhuliche（助力车）数据集
+# GRPO (Group Relative Policy Optimization) 训练配置
+
+# ============================================
+# 模型配置
+# ============================================
+model_name_or_path: /root/code/zqg/downloaded_models/Qwen3-8b/Qwen/Qwen3-8B
+trust_remote_code: true
+dtype: bfloat16
+
+# ============================================
+# 数据集配置
+# ============================================
+# GRPO只需要prompt数据，训练时会自动生成completion
+datasets:
+  - path: json
+    data_files: /root/code/zqg/train_data/zhuliche/zhuliche_rl_output.jsonl
+    split: train
+dataset_train_split: train
+
+# ============================================
+# 奖励函数配置
+# ============================================
+# 所有函数已归一化到 [-1.0, 1.0] 或 [0.0, 1.0] 范围
+reward_funcs: 
+  - "custom_reward_example.format_reward"              # 格式奖励：检查 <think>...</think> 格式
+  - "custom_reward_example.think_length_reward"         # 思考长度奖励：检查思考标签内内容长度
+  - "custom_reward_example.keywords_reward"            # 关键词奖励：检查负面关键词
+  - "custom_reward_example.length_reward"              # 长度奖励：根据总长度给予奖励/惩罚
+  - "custom_reward_example.reference_validity_reward"  # 引用有效性检查：检查 $[[xxx]] 引用
+  - "custom_reward_example.quality_check_reward"       # 质量检查（规则基础）
+  - "custom_reward_example.llm_quality_check_reward"    # 质量检查（LLM API，需要api.py）
+
+# 权重配置：
+# 格式奖励(0.1) + 思考长度(0.1) + 关键词(0.1) + 长度(0.1) + 引用有效性(0.2) + 质量检查规则(0.2) + 质量检查LLM(0.2) = 1.0
+# 质量检查(0.4) > 引用有效性(0.2) > 格式/思考长度/关键词/长度(各0.1)
+reward_weights: [0.1, 0.1, 0.1, 0.1, 0.2, 0.2, 0.2]
+
+# ============================================
+# GRPO特定参数
+# ============================================
+num_generations: 4  # 每个prompt生成的completion数量（必须>=2，从8降低到4以节省时间）
+max_completion_length: 150
+max_prompt_length: 5120
+beta: 0.0  # KL散度系数（0.0表示不使用reference model，节省内存）
+epsilon: 0.2  # PPO clipping epsilon
+scale_rewards: "group"  # 奖励缩放策略："group"（组内标准化，推荐）、"batch"、"none"
+loss_type: "dapo"  # 损失类型："dapo"（推荐）、"dr_grpo"、"grpo"、"bnpo"
+
+# ============================================
+# 训练参数
+# ============================================
+learning_rate: 2.0e-5
+num_train_epochs: 3
+per_device_train_batch_size: 2
+gradient_accumulation_steps: 8  # effective_batch_size必须能被num_generations整除
+max_train_samples: 4334  # 随机采样50%的训练数据（总数据8669条，50%约4334条）以节省时间
+gradient_checkpointing: true
+gradient_checkpointing_kwargs:
+  use_reentrant: false  # 使用 reentrant=False 以解决 DDP + LoRA + gradient checkpointing 兼容性问题（避免参数被标记两次的错误）
+
+# ============================================
+# 生成参数
+# ============================================
+temperature: 1.0
+top_p: 1.0
+
+# ============================================
+# LoRA配置
+# ============================================
+use_peft: true
+lora_r: 32
+lora_alpha: 16
+lora_target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]
+
+# ============================================
+# 输出配置
+# ============================================
+output_dir: /root/code/zqg/train_model/Qwen3-8b-lora-zhuliche-grpo
+push_to_hub: false
+save_strategy: steps
+save_steps: 200
+eval_strategy: "no"  # 数据集中没有test split，禁用评估（必须加引号，否则YAML会解析为布尔值False）
+# eval_steps: 200  # 已禁用评估，此参数不再需要
+logging_steps: 10
+
+# ============================================
+# 其他配置
+# ============================================
+eos_token: '<|im_end|>'
+log_completions: true  # 记录生成的completion（用于调试）
+shuffle_dataset: true
+remove_unused_columns: true  # GRPO只需要prompt列```
+
+---
+
+## /root/code/zqg/train_model/merge_lora.sh
+
+```bash
+# 合并最佳4b检查点 (checkpoint-400, best_metric: 0.158)
+python /root/code/zqg/trl/examples/research_projects/stack_llama/scripts/merge_peft_adapter.py \
+    --base_model_name="/root/code/zqg/downloaded_models/Qwen3-4b/Qwen/Qwen3-4B" \
+    --adapter_model_name="/root/code/zqg/train_model/Qwen3-4b-lora-zhuliche/checkpoint-400" \
+    --output_name="/root/code/zqg/train_model/merged_models/Qwen3-4b-merged-zhuliche"
+
+# 合并最佳8b检查点 (checkpoint-600, best_metric: 0.147)
+python /root/code/zqg/trl/examples/research_projects/stack_llama/scripts/merge_peft_adapter.py \
+    --base_model_name="/root/code/zqg/downloaded_models/Qwen3-8b/Qwen/Qwen3-8B" \
+    --adapter_model_name="/root/code/zqg/train_model/Qwen3-8b-lora-zhuliche/checkpoint-600" \
+    --output_name="/root/code/zqg/train_model/merged_models/Qwen3-8b-merged-zhuliche"
+
+# 以下为其他合并命令（已注释，需要时可取消注释）
+
+# 合并 14b checkpoint-165
+# python /root/code/zqg/trl/examples/research_projects/stack_llama/scripts/merge_peft_adapter.py \
+#     --base_model_name="/root/code/zqg/downloaded_models/Qwen3-14B/Qwen/Qwen3-14B" \
+#     --adapter_model_name="/root/code/zqg/train_model/Qwen3-14b-lora-danche/checkpoint-165" \
+#     --output_name="/root/code/zqg/train_model/merged_models/Qwen3-14b-merged-danche"
+
+# 合并 8b danche checkpoint-1000
+# python /root/code/zqg/trl/examples/research_projects/stack_llama/scripts/merge_peft_adapter.py \
+#     --base_model_name="/root/code/zqg/downloaded_models/Qwen3-8b/Qwen/Qwen3-8B" \
+#     --adapter_model_name="/root/code/zqg/train_model/Qwen3-8b-lora-danche-1203/checkpoint-1000" \
+#     --output_name="/root/code/zqg/train_model/merged_models/Qwen3-8b-merged-danche-1203"
+
+```
+
+---
+
+## /root/code/nxw/verl/merge_zhuliche_step48.sh
+
+```bash
+#!/bin/bash
+# Merge Step 48 checkpoint (最佳checkpoint，奖励分数: 0.980193)
+# 从 FSDP checkpoint 合并为 HuggingFace 格式模型
+
+export CUDA_VISIBLE_DEVICES=0
+python -m verl.model_merger merge \
+    --backend fsdp \
+    --local_dir /root/code/zqg/checkpoint_evaluation/checkpoints/verl_grpo/qwen3_8b_zhuliche_v4/global_step_48/actor \
+    --target_dir /root/code/zqg/rl_models/qwen3_8b_zhuliche_v4_grpo_step48
+
+```
+
+---
+
+## /root/code/nxw/verl/run_grpo_zhuliche.sh
+
+```bash
+# Tested successfully on the hiyouga/verl:ngc-th2.6.0-cu126-vllm0.8.4-flashinfer0.2.2-cxx11abi0 image.
+# 针对8B模型和8卡优化：增大batch size以提升训练速度
+
+set -x
+
+
+python3 -m verl.trainer.main_ppo \
+    algorithm.adv_estimator=grpo \
+    data.train_files=/root/code/zqg/train_data/zhuliche/zhuliche_rl_output_train.parquet \
+    data.val_files=/root/code/zqg/train_data/zhuliche/zhuliche_rl_output_var.parquet \
+    data.train_batch_size=1024 \
+    data.max_prompt_length=5120 \
+    data.max_response_length=150 \
+    data.filter_overlong_prompts=True \
+    data.truncation='error' \
+    actor_rollout_ref.model.path=/root/code/zqg/train_model/merged_models/Qwen3-8b-merged-zhuliche \
+    actor_rollout_ref.model.use_remove_padding=True \
+    actor_rollout_ref.model.enable_gradient_checkpointing=True \
+    actor_rollout_ref.actor.optim.lr=1e-6 \
+    actor_rollout_ref.actor.ppo_mini_batch_size=256 \
+    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=4 \
+    actor_rollout_ref.actor.use_kl_loss=True \
+    actor_rollout_ref.actor.kl_loss_coef=0.001 \
+    actor_rollout_ref.actor.kl_loss_type=low_var_kl \
+    actor_rollout_ref.actor.entropy_coeff=0 \
+    actor_rollout_ref.actor.fsdp_config.param_offload=False \
+    actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
+    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=4 \
+    actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
+    actor_rollout_ref.rollout.name=vllm \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.65 \
+    actor_rollout_ref.rollout.n=3 \
+    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=2 \
+    actor_rollout_ref.ref.fsdp_config.param_offload=True \
+    algorithm.use_kl_in_reward=False \
+    trainer.critic_warmup=0 \
+    trainer.logger='["console","wandb"]' \
+    trainer.project_name='verl_grpo' \
+    trainer.experiment_name='qwen3_8b' \
+    trainer.n_gpus_per_node=8 \
+    trainer.nnodes=1 \
+    trainer.save_freq=2 \
+    trainer.test_freq=10 \
+    trainer.total_epochs=2 \
+    custom_reward_function.path='/root/code/zqg/train_model/verl_reward_functions.py' \
+    custom_reward_function.name='compute_score' \
+    +reward_model.reward_kwargs.max_workers=60 \
+    +reward_model.reward_kwargs.use_multiprocessing=false
+
+        # '/root/code/nxw/verl/verl/utils/reward_score/my_reward.py' \
+
+```
+
